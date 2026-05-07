@@ -56,9 +56,7 @@ class LogShape:
             method = payload[self.method_field]
             path = payload[self.path_field]
             status = int(payload[self.status_field])
-            time_us = int(
-                float(payload[self.time_field]) * _TO_US[self.time_unit]
-            )
+            time_us = int(float(payload[self.time_field]) * _TO_US[self.time_unit])
         except (KeyError, ValueError, TypeError):
             return None
         return method, path, time_us, status
