@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The DataTable no longer yanks the viewport back to the top on every
   refresh tick. The scroll offset is saved before the rebuild and
   restored after, so scrolling stays where you put it.
+- The row cursor (the highlight you get when you click or arrow-key
+  to a row) is now preserved across refresh ticks. We snapshot the
+  ``(method, path)`` under the cursor before the rebuild and move the
+  cursor back onto the same endpoint after, so re-sorts don't drop
+  the marker.
 
 ### Removed
 

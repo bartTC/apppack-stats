@@ -164,6 +164,10 @@ class StatsApp(App):
         self.proc = proc
         self.sort_col = "avg"
         self.sort_reverse = True
+        # Snapshot of the (method, path) at each rendered row index, so
+        # the cursor can follow its endpoint across re-sorts instead of
+        # snapping back to row 0 every refresh.
+        self._displayed_keys: list[tuple[str, str]] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -174,10 +178,10 @@ class StatsApp(App):
     # compute how much room is left for the Path column on the current
     # terminal so the numeric columns never get pushed offscreen.
     _OTHER_COLS_WIDTH = 8 + 8 + 8 + 8 + 8 + 6 + 6
-    # Per-cell padding/borders that DataTable reserves around each
-    # column. Conservative — we'd rather leave a little gap on the
-    # right than clip a column.
-    _COLUMN_OVERHEAD = 12
+    # Per-cell padding/borders DataTable reserves around each column,
+    # plus the vertical scrollbar lane. Conservative — we'd rather
+    # leave a little gap on the right than trip a horizontal scrollbar.
+    _COLUMN_OVERHEAD = 24
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
@@ -240,12 +244,22 @@ class StatsApp(App):
         items.sort(key=_SORT_KEYS[self.sort_col], reverse=self.sort_reverse)
 
         table = self.query_one(DataTable)
-        # Preserve the user's scroll position across the clear/re-add
-        # cycle — otherwise every tick yanks them back to the top.
+        # Preserve scroll position and the row the user has highlighted
+        # across the clear/re-add cycle — otherwise every tick yanks
+        # them back to the top and clears their selection.
         saved_scroll_y = table.scroll_y
+        saved_cursor_key: tuple[str, str] | None = None
+        if (
+            self._displayed_keys
+            and 0 <= table.cursor_row < len(self._displayed_keys)
+        ):
+            saved_cursor_key = self._displayed_keys[table.cursor_row]
+
         table.clear()
         pw = self._path_width()
+        new_keys: list[tuple[str, str]] = []
         for (method, path), bucket in items:
+            new_keys.append((method, path))
             table.add_row(
                 method,
                 _truncate(path, pw),
@@ -256,6 +270,15 @@ class StatsApp(App):
                 str(bucket.errors_4xx) if bucket.errors_4xx else "",
                 str(bucket.errors_5xx) if bucket.errors_5xx else "",
             )
+        self._displayed_keys = new_keys
+
+        if saved_cursor_key is not None:
+            try:
+                new_row = new_keys.index(saved_cursor_key)
+            except ValueError:
+                new_row = None
+            if new_row is not None:
+                table.move_cursor(row=new_row, animate=False)
         if saved_scroll_y:
             table.scroll_to(y=saved_scroll_y, animate=False)
         self.title = f"apppack-stats — {parsed}/{total} lines, {elapsed:.0f}s"
