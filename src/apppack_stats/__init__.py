@@ -155,11 +155,13 @@ class StatsApp(App):
         self,
         stats: Stats,
         *,
+        app_name: str,
         refresh: float,
         proc: subprocess.Popen,
     ) -> None:
         super().__init__()
         self.stats = stats
+        self.app_name = app_name
         self.refresh_sec = refresh
         self.proc = proc
         self.sort_col = "avg"
@@ -167,10 +169,13 @@ class StatsApp(App):
         self._rendered_rows: dict[str, tuple[str, ...]] = {}
         self._last_path_width: int | None = None
         self._needs_sort = True
+        self._sort_frozen_until = 0.0
+        self._selected_row_key: str | None = None
+        self._restoring_cursor = False
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield DataTable(zebra_stripes=True, show_cursor=False, cursor_type="none")
+        yield DataTable(zebra_stripes=True, cursor_type="row")
         yield Footer()
 
     # Fixed widths of every non-path column (see ``on_mount``). Used to
@@ -181,6 +186,7 @@ class StatsApp(App):
     # plus the vertical scrollbar lane. Conservative — we'd rather
     # leave a little gap on the right than trip a horizontal scrollbar.
     _COLUMN_OVERHEAD = 24
+    _SORT_FREEZE_SEC = 2.0
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
@@ -192,7 +198,7 @@ class StatsApp(App):
         table.add_column("Max ms", key="max", width=8)
         table.add_column("4xx", key="4xx", width=6)
         table.add_column("5xx", key="5xx", width=6)
-        self.title = "apppack-stats"
+        self.title = f"apppack-stats for {self.app_name}"
         self._update_subtitle()
         self.set_interval(self.refresh_sec, self._tick)
         self._tick()
@@ -200,7 +206,6 @@ class StatsApp(App):
     def on_resize(self) -> None:
         # Re-render immediately so the path column is recomputed for
         # the new terminal width.
-        self._needs_sort = True
         self._tick()
 
     def _path_width(self) -> int:
@@ -239,9 +244,24 @@ class StatsApp(App):
         else:
             self.sort_col = col_key
             self.sort_reverse = col_key in _NUMERIC_COLS
+        self._sort_frozen_until = 0.0
         self._needs_sort = True
         self._update_subtitle()
         self._tick()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self._selected_row_key = str(event.row_key.value)
+        if self._restoring_cursor:
+            return
+        self._sort_frozen_until = monotonic() + self._SORT_FREEZE_SEC
+
+    def on_data_table_row_highlighted(
+        self, event: DataTable.RowHighlighted
+    ) -> None:
+        self._selected_row_key = str(event.row_key.value)
+        if self._restoring_cursor:
+            return
+        self._sort_frozen_until = monotonic() + self._SORT_FREEZE_SEC
 
     def action_toggle_normalize(self) -> None:
         with self.stats.lock:
@@ -307,13 +327,29 @@ class StatsApp(App):
             if existing_key not in live_row_keys:
                 table.remove_row(existing_row_key)
                 self._rendered_rows.pop(existing_key, None)
+                if existing_key == self._selected_row_key:
+                    self._selected_row_key = None
                 rows_changed = True
 
-        if rows_changed or self._needs_sort:
+        sort_is_frozen = monotonic() < self._sort_frozen_until
+        if (rows_changed or self._needs_sort) and not sort_is_frozen:
             table.sort(key=self._sort_key_from_row, reverse=self.sort_reverse)
             self._needs_sort = False
+        if self._selected_row_key and self._selected_row_key in table.rows:
+            selected_row_index = table.get_row_index(self._selected_row_key)
+            if table.cursor_row != selected_row_index:
+                self._restoring_cursor = True
+                try:
+                    table.move_cursor(
+                        row=selected_row_index, animate=False, scroll=False
+                    )
+                finally:
+                    self._restoring_cursor = False
         self._last_path_width = pw
-        self.title = f"apppack-stats — {parsed}/{total} lines, {elapsed:.0f}s"
+        self.title = (
+            f"apppack-stats for {self.app_name} — "
+            f"{parsed}/{total} lines, {elapsed:.0f}s"
+        )
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -406,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     reader.start()
 
-    app = StatsApp(stats, refresh=args.refresh, proc=proc)
+    app = StatsApp(stats, app_name=args.app, refresh=args.refresh, proc=proc)
     user_initiated = False
     try:
         app.run()
