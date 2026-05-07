@@ -164,14 +164,13 @@ class StatsApp(App):
         self.proc = proc
         self.sort_col = "avg"
         self.sort_reverse = True
-        # Snapshot of the (method, path) at each rendered row index, so
-        # the cursor can follow its endpoint across re-sorts instead of
-        # snapping back to row 0 every refresh.
-        self._displayed_keys: list[tuple[str, str]] = []
+        self._rendered_rows: dict[str, tuple[str, ...]] = {}
+        self._last_path_width: int | None = None
+        self._needs_sort = True
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield DataTable(zebra_stripes=True, cursor_type="row")
+        yield DataTable(zebra_stripes=True, show_cursor=False, cursor_type="none")
         yield Footer()
 
     # Fixed widths of every non-path column (see ``on_mount``). Used to
@@ -201,12 +200,33 @@ class StatsApp(App):
     def on_resize(self) -> None:
         # Re-render immediately so the path column is recomputed for
         # the new terminal width.
+        self._needs_sort = True
         self._tick()
 
     def _path_width(self) -> int:
         return max(
             20, self.size.width - self._OTHER_COLS_WIDTH - self._COLUMN_OVERHEAD
         )
+
+    @staticmethod
+    def _row_key(method: str, path: str) -> str:
+        return f"{method}\0{path}"
+
+    def _sort_key_from_row(self, row: tuple[object, ...]) -> object:
+        sort_index = {
+            "method": 0,
+            "path": 1,
+            "count": 2,
+            "avg": 3,
+            "p95": 4,
+            "max": 5,
+            "4xx": 6,
+            "5xx": 7,
+        }[self.sort_col]
+        value = row[sort_index]
+        if self.sort_col in _NUMERIC_COLS:
+            return int(str(value) or "0")
+        return value
 
     def on_data_table_header_selected(
         self, event: DataTable.HeaderSelected
@@ -219,12 +239,14 @@ class StatsApp(App):
         else:
             self.sort_col = col_key
             self.sort_reverse = col_key in _NUMERIC_COLS
+        self._needs_sort = True
         self._update_subtitle()
         self._tick()
 
     def action_toggle_normalize(self) -> None:
         with self.stats.lock:
             self.stats.normalize = not self.stats.normalize
+        self._needs_sort = True
         self._update_subtitle()
 
     def _update_subtitle(self) -> None:
@@ -236,6 +258,9 @@ class StatsApp(App):
         if self.proc.poll() is not None:
             self.exit()
             return
+        table = self.query_one(DataTable)
+        if len(table.columns) != len(_SORT_KEYS):
+            return
         with self.stats.lock:
             items = list(self.stats.buckets.items())
             elapsed = monotonic() - self.stats.started
@@ -243,24 +268,14 @@ class StatsApp(App):
             parsed = self.stats.parsed_lines
         items.sort(key=_SORT_KEYS[self.sort_col], reverse=self.sort_reverse)
 
-        table = self.query_one(DataTable)
-        # Preserve scroll position and the row the user has highlighted
-        # across the clear/re-add cycle — otherwise every tick yanks
-        # them back to the top and clears their selection.
-        saved_scroll_y = table.scroll_y
-        saved_cursor_key: tuple[str, str] | None = None
-        if (
-            self._displayed_keys
-            and 0 <= table.cursor_row < len(self._displayed_keys)
-        ):
-            saved_cursor_key = self._displayed_keys[table.cursor_row]
-
-        table.clear()
         pw = self._path_width()
-        new_keys: list[tuple[str, str]] = []
+        path_width_changed = pw != self._last_path_width
+        live_row_keys: set[str] = set()
+        rows_changed = False
         for (method, path), bucket in items:
-            new_keys.append((method, path))
-            table.add_row(
+            row_key = self._row_key(method, path)
+            live_row_keys.add(row_key)
+            row = (
                 method,
                 _truncate(path, pw),
                 str(bucket.count),
@@ -270,17 +285,34 @@ class StatsApp(App):
                 str(bucket.errors_4xx) if bucket.errors_4xx else "",
                 str(bucket.errors_5xx) if bucket.errors_5xx else "",
             )
-        self._displayed_keys = new_keys
+            previous_row = self._rendered_rows.get(row_key)
+            if row_key not in table.rows:
+                table.add_row(*row, key=row_key)
+                self._rendered_rows[row_key] = row
+                rows_changed = True
+                continue
+            if previous_row == row and not path_width_changed:
+                continue
+            for column_key, old_value, new_value in zip(_SORT_KEYS, previous_row or (), row):
+                if old_value != new_value:
+                    table.update_cell(row_key, column_key, new_value, update_width=False)
+            if previous_row is None:
+                for column_key, new_value in zip(_SORT_KEYS, row):
+                    table.update_cell(row_key, column_key, new_value, update_width=False)
+            self._rendered_rows[row_key] = row
+            rows_changed = True
 
-        if saved_cursor_key is not None:
-            try:
-                new_row = new_keys.index(saved_cursor_key)
-            except ValueError:
-                new_row = None
-            if new_row is not None:
-                table.move_cursor(row=new_row, animate=False)
-        if saved_scroll_y:
-            table.scroll_to(y=saved_scroll_y, animate=False)
+        for existing_row_key in list(table.rows):
+            existing_key = str(existing_row_key.value)
+            if existing_key not in live_row_keys:
+                table.remove_row(existing_row_key)
+                self._rendered_rows.pop(existing_key, None)
+                rows_changed = True
+
+        if rows_changed or self._needs_sort:
+            table.sort(key=self._sort_key_from_row, reverse=self.sort_reverse)
+            self._needs_sort = False
+        self._last_path_width = pw
         self.title = f"apppack-stats — {parsed}/{total} lines, {elapsed:.0f}s"
 
 

@@ -35,14 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a new session (no controlling TTY) and, when *we* are the ones
   shutting it down, swallow its captured stderr — any signal-handler
   noise it emits is a side effect of our signal, not a real error.
-- The DataTable no longer yanks the viewport back to the top on every
-  refresh tick. The scroll offset is saved before the rebuild and
-  restored after, so scrolling stays where you put it.
-- The row cursor (the highlight you get when you click or arrow-key
-  to a row) is now preserved across refresh ticks. We snapshot the
-  ``(method, path)`` under the cursor before the rebuild and move the
-  cursor back onto the same endpoint after, so re-sorts don't drop
-  the marker.
+- The DataTable now follows Textual's intended live-update path:
+  rows are updated in place with stable row keys, removed with
+  `remove_row`, and re-sorted without clearing and rebuilding the
+  widget on every refresh tick. Only changed rows are touched, which
+  makes scrolling much smoother on busy tables. Row selection has been
+  disabled, so clicking table rows no longer hijacks scrolling.
 
 ### Removed
 
