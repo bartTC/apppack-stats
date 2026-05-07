@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The title bar now includes the target app name as
+  `apppack-stats for <app>`, and keeps that prefix while the live
+  counters update.
+
+### Fixed
+
+- The DataTable now follows Textual's intended live-update path:
+  rows are updated in place with stable row keys, removed with
+  `remove_row`, and re-sorted without clearing and rebuilding the
+  widget on every refresh tick. Only changed rows are touched, which
+  makes scrolling much smoother on busy tables. Row highlighting is
+  preserved by row key across refreshes and re-sorts, so a selected
+  endpoint stays selected even while new data arrives.
+
 ## [0.3.0] - 2026-05-07
 
 ### Added
@@ -24,9 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   columns (and `errors_4xx` / `errors_5xx` in the CSV output). 4xx
   responses are usually noise (404 on `/favicon.ico`, 401s, etc.);
   5xx responses are the signal you actually want to surface.
-- The title bar now includes the target app name as
-  `apppack-stats for <app>`, and keeps that prefix while the live
-  counters update.
 - Long request paths are now truncated with an ellipsis so the
   numeric columns are always visible, even on narrow terminals. The
   truncation width adapts to the terminal width on resize.
@@ -38,13 +53,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a new session (no controlling TTY) and, when *we* are the ones
   shutting it down, swallow its captured stderr — any signal-handler
   noise it emits is a side effect of our signal, not a real error.
-- The DataTable now follows Textual's intended live-update path:
-  rows are updated in place with stable row keys, removed with
-  `remove_row`, and re-sorted without clearing and rebuilding the
-  widget on every refresh tick. Only changed rows are touched, which
-  makes scrolling much smoother on busy tables. Row highlighting is
-  preserved by row key across refreshes and re-sorts, so a selected
-  endpoint stays selected even while new data arrives.
 
 ### Removed
 
