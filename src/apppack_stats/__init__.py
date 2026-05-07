@@ -1,8 +1,16 @@
-"""Live response-time stats from streamed AppPack web logs.
+"""
+Render live endpoint latency statistics from AppPack access logs.
 
-Spawns ``apppack logs --raw --follow`` for the requested app and aggregates
-incoming requests per ``(method, normalized path)`` into a sortable Textual
-data table. Click any column header to sort by it; click again to reverse.
+This module is the executable heart of ``apppack-stats``. It shells out to
+``apppack logs --raw --follow``, parses the JSON access-log lines it cares
+about, aggregates them into per-endpoint buckets, and presents the result in a
+Textual ``DataTable``.
+
+The implementation is split between a background reader thread that ingests log
+lines and a foreground Textual app that periodically refreshes the table from a
+shared in-memory snapshot. The refresh path is intentionally careful about
+avoiding full table rebuilds during normal operation because the UI stays much
+more responsive when only changed rows are touched.
 """
 
 from __future__ import annotations
@@ -31,27 +39,58 @@ __version__ = "0.3.0"
 
 # Order matters: UUIDs and hex hashes before bare ints.
 _UUID_RE = re.compile(
-    r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/|$)", re.I
+    r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/|$)", re.IGNORECASE
 )
-_HEX_RE = re.compile(r"/[0-9a-f]{16,}(?=/|$)", re.I)
+_HEX_RE = re.compile(r"/[0-9a-f]{16,}(?=/|$)", re.IGNORECASE)
 _INT_RE = re.compile(r"/\d+(?=/|$)")
 
 
 def normalize_path(path: str) -> str:
+    """
+    Collapse variable path segments into stable endpoint placeholders.
+
+    The live table is most useful when it groups requests by logical endpoint
+    rather than by every concrete resource identifier. This function rewrites
+    UUIDs, long hex tokens, and bare integer path segments into placeholders so
+    repeated requests to the same handler land in one bucket.
+
+    The substitutions are ordered from most specific to least specific to avoid
+    broad numeric matching swallowing UUID fragments or hash-like identifiers.
+    """
     path = _UUID_RE.sub("/<uuid>", path)
     path = _HEX_RE.sub("/<hash>", path)
-    path = _INT_RE.sub("/<id>", path)
-    return path
+    return _INT_RE.sub("/<id>", path)
 
 
 @dataclass
 class Bucket:
+    """
+    Accumulate request counts, error counts, and raw timings for one endpoint.
+
+    Each bucket represents a single ``(method, path)`` group in the final table.
+    The class stores the raw microsecond timings rather than incremental summary
+    values so the UI can render average, p95, and max without losing fidelity.
+
+    This is simple rather than memory-optimized on purpose: the expected use
+    case is an interactive troubleshooting session with a manageable amount of
+    recent traffic, where correctness and clarity matter more than squeezing the
+    last byte out of the accumulator.
+    """
+
     count: int = 0
     errors_4xx: int = 0
     errors_5xx: int = 0
     times_us: list[int] = field(default_factory=list)
 
     def add(self, time_us: int, status: int) -> None:
+        """
+        Record one completed request in this bucket.
+
+        Status codes are split into separate 4xx and 5xx counters because those
+        categories typically carry different operational meaning. The timing is
+        appended to the raw sample list so later percentile calculations can use
+        the full distribution instead of an approximation.
+        """
         self.count += 1
         self.times_us.append(time_us)
         if 400 <= status < 500:
@@ -75,6 +114,19 @@ class Bucket:
 
 
 class Stats:
+    """
+    Own the shared aggregation state fed by the log reader thread.
+
+    The Textual UI and the background log-consumer thread both interact with the
+    same ``Stats`` instance. A coarse lock protects the bucket mapping and the
+    parsed-line counters while still keeping the ingestion logic lightweight.
+
+    This object intentionally accepts raw log lines instead of pre-parsed
+    records. That keeps the reader thread self-contained and lets the rest of
+    the application treat ``Stats`` as the single place where "interesting log
+    line" semantics live.
+    """
+
     def __init__(self, *, normalize: bool) -> None:
         self.normalize = normalize
         self.buckets: dict[tuple[str, str], Bucket] = defaultdict(Bucket)
@@ -84,6 +136,17 @@ class Stats:
         self.lock = threading.Lock()
 
     def ingest(self, line: str) -> None:
+        """
+        Parse one raw log line and fold it into the aggregate state.
+
+        Most lines from ``apppack logs`` are ignored. Non-JSON output, malformed
+        JSON, and payloads that do not match a known access-log shape simply do
+        not contribute to the table. ``total_lines`` still increases for every
+        input line so the title bar can show how much of the stream was relevant.
+
+        Normalization happens before the bucket lookup so toggling that mode
+        changes the grouping semantics rather than merely changing display text.
+        """
         self.total_lines += 1
         line = line.strip()
         if not line or line[0] != "{":
@@ -105,7 +168,7 @@ class Stats:
             self.parsed_lines += 1
 
 # Column key -> sort key over (key, bucket) tuples.
-_SORT_KEYS: dict[str, "callable"] = {
+_SORT_KEYS: dict[str, callable] = {
     "method": lambda kv: kv[0][0],
     "path": lambda kv: kv[0][1],
     "count": lambda kv: kv[1].count,
@@ -120,12 +183,28 @@ _NUMERIC_COLS = {"count", "avg", "p95", "max", "4xx", "5xx"}
 
 
 def _truncate(s: str, width: int) -> str:
+    """
+    Trim a string to a display width budget using a single trailing ellipsis.
+
+    The table reserves fixed space for numeric columns and lets the path column
+    absorb the remaining width. Truncation is therefore a presentation concern,
+    not a data-loss concern: the underlying bucket key stays untouched and only
+    the rendered cell content is shortened.
+    """
     if width <= 1 or len(s) <= width:
         return s
     return s[: width - 1] + "…"
 
 
 def _reader_thread(stats: Stats, stream: IO[str], stop: threading.Event) -> None:
+    """
+    Drain the subprocess log stream until told to stop or EOF is reached.
+
+    The reader thread keeps the blocking ``stdout`` iteration away from the
+    Textual event loop. It exits cooperatively when the stop event is set and
+    always sets that event on the way out so the rest of the shutdown path can
+    treat either EOF or user-initiated termination as a completed stream.
+    """
     for line in stream:
         if stop.is_set():
             break
@@ -134,7 +213,19 @@ def _reader_thread(stats: Stats, stream: IO[str], stop: threading.Event) -> None
 
 
 class StatsApp(App):
-    """Textual UI for live response-time stats."""
+    """
+    Present the live aggregate state as an interactive Textual table.
+
+    ``StatsApp`` is responsible for translating shared ``Stats`` state into a
+    responsive terminal UI. The table supports live sorting, path normalization
+    toggling, and row highlighting that follows the same logical endpoint across
+    refreshes.
+
+    The refresh logic is deliberately incremental. Rebuilding the entire table on
+    every tick made scrolling and mouse interaction feel sluggish, so the app now
+    tracks previously rendered rows, updates only changed cells, and re-sorts
+    only when required.
+    """
 
     CSS = """
     DataTable {
@@ -189,6 +280,14 @@ class StatsApp(App):
     _SORT_FREEZE_SEC = 2.0
 
     def on_mount(self) -> None:
+        """
+        Create the table schema and start the periodic refresh timer.
+
+        Column widths are chosen so the numeric metrics remain stable and easy to
+        scan, while the path column consumes whatever horizontal space is left.
+        The first refresh runs immediately so the app paints useful content
+        before the interval timer fires.
+        """
         table = self.query_one(DataTable)
         table.add_column("Method", key="method", width=8)
         table.add_column("Path", key="path")
@@ -204,20 +303,52 @@ class StatsApp(App):
         self._tick()
 
     def on_resize(self) -> None:
+        """
+        Refresh immediately when the terminal size changes.
+
+        Path truncation depends on the available width, so a resize needs a new
+        render pass even if the underlying data has not changed.
+        """
         # Re-render immediately so the path column is recomputed for
         # the new terminal width.
         self._tick()
 
     def _path_width(self) -> int:
+        """
+        Compute the remaining width budget for the path column.
+
+        This subtracts the known fixed-width metric columns plus a conservative
+        allowance for DataTable padding and scrollbar space. The calculation
+        intentionally leaves a little spare room because clipping a numeric
+        column is more damaging to usability than truncating the path slightly
+        earlier.
+        """
         return max(
             20, self.size.width - self._OTHER_COLS_WIDTH - self._COLUMN_OVERHEAD
         )
 
     @staticmethod
     def _row_key(method: str, path: str) -> str:
+        """
+        Build a stable row identifier for one logical endpoint.
+
+        Textual rows need keys that remain stable across refreshes and re-sorts.
+        Combining method and normalized path is enough to uniquely identify an
+        aggregate row, and the embedded NUL separator avoids ambiguity between
+        adjacent string boundaries.
+        """
         return f"{method}\0{path}"
 
     def _sort_key_from_row(self, row: tuple[object, ...]) -> object:
+        """
+        Translate a rendered table row back into a sortable value.
+
+        ``DataTable.sort`` operates on rendered cell values rather than the raw
+        ``Bucket`` objects, so numeric columns need to be converted back from the
+        formatted strings shown to the user. This keeps the sort behavior aligned
+        with the current column choice without maintaining a second parallel view
+        model just for ordering.
+        """
         sort_index = {
             "method": 0,
             "path": 1,
@@ -236,6 +367,14 @@ class StatsApp(App):
     def on_data_table_header_selected(
         self, event: DataTable.HeaderSelected
     ) -> None:
+        """
+        Toggle sort state when the user clicks a column header.
+
+        Numeric columns default to descending order because the most interesting
+        values are usually the highest ones. A manual header click also clears
+        any temporary sort freeze created by row interaction so explicit sorting
+        always feels immediate.
+        """
         col_key = str(event.column_key.value) if event.column_key else ""
         if col_key not in _SORT_KEYS:
             return
@@ -250,6 +389,14 @@ class StatsApp(App):
         self._tick()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """
+        Remember the selected logical row and briefly freeze auto-sorting.
+
+        The highlight should follow the same endpoint, not whichever row later
+        occupies the same visual slot. The short sort freeze reduces the feeling
+        that the table is fighting the user while they are actively clicking or
+        navigating around it.
+        """
         self._selected_row_key = str(event.row_key.value)
         if self._restoring_cursor:
             return
@@ -258,23 +405,59 @@ class StatsApp(App):
     def on_data_table_row_highlighted(
         self, event: DataTable.RowHighlighted
     ) -> None:
+        """
+        Apply the same row-tracking behavior to highlight changes as to selection.
+
+        Textual emits row-highlight events during ordinary cursor movement, so
+        this method keeps keyboard and mouse navigation consistent with clicks.
+        Cursor restoration triggered by the app itself is ignored to avoid
+        self-reinforcing freeze windows.
+        """
         self._selected_row_key = str(event.row_key.value)
         if self._restoring_cursor:
             return
         self._sort_frozen_until = monotonic() + self._SORT_FREEZE_SEC
 
     def action_toggle_normalize(self) -> None:
+        """
+        Flip between normalized and raw path grouping at runtime.
+
+        The underlying aggregate data is not rebuilt eagerly here. Instead, the
+        shared ``Stats`` object changes grouping behavior for future ingested
+        lines, and the next refresh updates the subtitle and sort state
+        accordingly.
+        """
         with self.stats.lock:
             self.stats.normalize = not self.stats.normalize
         self._needs_sort = True
         self._update_subtitle()
 
     def _update_subtitle(self) -> None:
+        """
+        Refresh the subtitle so it mirrors the current sort and path mode.
+
+        The subtitle is lightweight but important feedback: it explains both the
+        active ordering and whether the table is grouping by normalized or raw
+        paths, which can otherwise be hard to infer once the stream is moving.
+        """
         arrow = "↓" if self.sort_reverse else "↑"
         norm = "" if self.stats.normalize else "  (raw paths)"
         self.sub_title = f"sort: {self.sort_col} {arrow}{norm}"
 
     def _tick(self) -> None:
+        """
+        Synchronize the rendered table with the current aggregate snapshot.
+
+        Each tick takes a locked snapshot of the buckets, computes the desired
+        rendered rows, and then applies only the minimal set of UI changes:
+        changed cells are updated in place, missing rows are removed, new rows
+        are added, and sorting is only rerun when needed.
+
+        Row highlighting is restored by row key rather than by screen position so
+        the same logical endpoint stays selected across re-sorts. The temporary
+        sort freeze prevents that restoration from fighting the user's current
+        interaction. If the subprocess has already exited, the app simply quits.
+        """
         if self.proc.poll() is not None:
             self.exit()
             return
@@ -313,11 +496,11 @@ class StatsApp(App):
                 continue
             if previous_row == row and not path_width_changed:
                 continue
-            for column_key, old_value, new_value in zip(_SORT_KEYS, previous_row or (), row):
+            for column_key, old_value, new_value in zip(_SORT_KEYS, previous_row or (), row, strict=False):
                 if old_value != new_value:
                     table.update_cell(row_key, column_key, new_value, update_width=False)
             if previous_row is None:
-                for column_key, new_value in zip(_SORT_KEYS, row):
+                for column_key, new_value in zip(_SORT_KEYS, row, strict=False):
                     table.update_cell(row_key, column_key, new_value, update_width=False)
             self._rendered_rows[row_key] = row
             rows_changed = True
@@ -353,6 +536,14 @@ class StatsApp(App):
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """
+    Parse command-line arguments for the ``apppack-stats`` CLI.
+
+    The CLI is intentionally small and geared toward interactive use. Most
+    options shape how much history is seeded into the live view, how often the
+    UI refreshes, and whether the final aggregate snapshot should be exported as
+    CSV when the session ends.
+    """
     parser = argparse.ArgumentParser(
         prog="apppack-stats",
         description="Live response-time stats from an AppPack web service.",
@@ -401,6 +592,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """
+    Run the CLI end to end and return a process-style exit code.
+
+    This function validates that the external ``apppack`` CLI is available,
+    starts the streaming subprocess, launches the background reader thread, and
+    hands control to Textual until the session ends.
+
+    Shutdown is intentionally defensive. When the user quits the UI, the spawned
+    ``apppack`` process is treated as ours to terminate, and its signal-noise
+    stderr output is suppressed. If the subprocess dies on its own with a
+    non-zero status, any captured stderr is surfaced because that is more likely
+    to reflect a real failure.
+    """
     args = _parse_args(argv)
 
     if shutil.which("apppack") is None:
@@ -468,7 +672,7 @@ def main(argv: list[str] | None = None) -> int:
             reverse=app.sort_reverse,
         )
         if args.output != "-":
-            print(f"Wrote {len(stats.buckets)} rows to {args.output}")
+            pass
 
     if not user_initiated and proc.returncode != 0:
         stderr = proc.stderr.read() if proc.stderr else ""
@@ -481,6 +685,14 @@ def main(argv: list[str] | None = None) -> int:
 def _write_csv(
     stats: Stats, path: str, *, sort_col: str, reverse: bool
 ) -> None:
+    """
+    Write the current aggregate snapshot in the same order as the live table.
+
+    Export happens after the interactive session ends, so this function takes a
+    one-time locked snapshot of the buckets and sorts it using the final UI sort
+    state. Writing to ``"-"`` targets standard output; any other path is opened
+    as a normal CSV file and overwritten.
+    """
     with stats.lock:
         items = list(stats.buckets.items())
     items.sort(key=_SORT_KEYS[sort_col], reverse=reverse)

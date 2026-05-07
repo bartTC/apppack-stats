@@ -1,13 +1,15 @@
-"""Pluggable extractors for known JSON access-log shapes.
+"""
+Recognize supported JSON access-log formats and normalize them for ingestion.
 
-Each :class:`LogShape` describes how to read four fields out of a JSON
-payload: HTTP method, request path, response status, and response time
-(plus the unit the time is in). :func:`extract_request` tries every
-registered shape in order and returns the first match.
+This module isolates all knowledge of concrete log payload shapes from the rest
+of the application. Each supported format is described declaratively as a
+``LogShape``, and the caller only sees a canonical
+``(method, path, response_time_us, status)`` tuple or ``None``.
 
-To add support for a new log format, append a new ``LogShape`` to the
-``SHAPES`` list at the bottom of this module. If your format has a
-unique top-level key, name it as ``time_field`` and you're done.
+The matching model is intentionally simple: the first shape whose trigger field
+is present claims the payload. That keeps the hot path fast and makes it easy to
+extend, but it also means new shapes should use distinctive trigger fields to
+avoid accidental collisions.
 """
 
 from __future__ import annotations
@@ -20,12 +22,16 @@ _TO_US = {"us": 1, "ms": 1_000, "s": 1_000_000}
 
 @dataclass(frozen=True)
 class LogShape:
-    """Description of one JSON access-log shape.
+    """
+    Describe how to extract one supported access-log payload shape.
 
-    A shape "matches" a payload when ``time_field`` is present at the
-    top level. The four field names point to the JSON keys to read;
-    ``time_unit`` selects the multiplier used to convert the raw time
-    value to microseconds.
+    A ``LogShape`` is a lightweight schema adapter. It says which top-level JSON
+    keys hold the method, path, status, and timing values, and how to convert
+    the raw timing unit into microseconds so the rest of the application can
+    compare all requests on the same scale.
+
+    The dataclass is frozen because shapes are effectively configuration. They
+    are defined once at import time and should not drift at runtime.
     """
 
     name: str
@@ -36,6 +42,14 @@ class LogShape:
     time_unit: str  # "us" | "ms" | "s"
 
     def extract(self, payload: dict) -> tuple[str, str, int, int] | None:
+        """
+        Attempt to read this shape out of a payload and normalize its timing.
+
+        A payload only counts as a match when the designated trigger field is
+        present. Missing keys, bad numeric values, or incompatible types all
+        cause this to return ``None`` rather than raising, because malformed or
+        irrelevant log lines are expected noise in the input stream.
+        """
         if self.time_field not in payload:
             return None
         try:
@@ -76,10 +90,13 @@ SHAPES: list[LogShape] = [
 
 
 def extract_request(payload: dict) -> tuple[str, str, int, int] | None:
-    """Try each registered :class:`LogShape` until one matches.
+    """
+    Convert a raw JSON payload into the canonical request tuple if possible.
 
-    Returns ``(method, path, response_time_us, status)`` or ``None`` if
-    no shape recognised the payload.
+    The registry order matters. The first shape that recognizes the payload wins,
+    which keeps extraction cheap and predictable as long as each shape uses a
+    distinctive trigger field. Payloads that do not resemble any known access
+    log format return ``None`` so callers can skip them quietly.
     """
     for shape in SHAPES:
         result = shape.extract(payload)
