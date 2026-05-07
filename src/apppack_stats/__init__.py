@@ -26,8 +26,9 @@ import sys
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from time import monotonic
-from typing import IO
+from typing import IO, ClassVar
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -39,10 +40,16 @@ __version__ = "0.3.0"
 
 # Order matters: UUIDs and hex hashes before bare ints.
 _UUID_RE = re.compile(
-    r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/|$)", re.IGNORECASE
+    r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=/|$)",
+    re.IGNORECASE,
 )
 _HEX_RE = re.compile(r"/[0-9a-f]{16,}(?=/|$)", re.IGNORECASE)
 _INT_RE = re.compile(r"/\d+(?=/|$)")
+_CLIENT_ERROR_MIN = 400
+_SERVER_ERROR_MIN = 500
+_MIN_SAMPLES_FOR_P95 = 2
+_P95_QUANTILES = 20
+_P95_INDEX = 18
 
 
 def normalize_path(path: str) -> str:
@@ -93,23 +100,44 @@ class Bucket:
         """
         self.count += 1
         self.times_us.append(time_us)
-        if 400 <= status < 500:
+        if _CLIENT_ERROR_MIN <= status < _SERVER_ERROR_MIN:
             self.errors_4xx += 1
-        elif status >= 500:
+        elif status >= _SERVER_ERROR_MIN:
             self.errors_5xx += 1
 
     @property
     def avg_ms(self) -> float:
+        """
+        Return the arithmetic mean latency in milliseconds.
+
+        The live UI rounds this value for display, but the property itself keeps
+        the underlying float precision so sorts and exports can use the exact
+        aggregate instead of the human-formatted string.
+        """
         return statistics.fmean(self.times_us) / 1000
 
     @property
     def p95_ms(self) -> float:
-        if len(self.times_us) < 2:
+        """
+        Return the 95th percentile latency in milliseconds.
+
+        Buckets with fewer than two samples do not have a meaningful percentile
+        distribution yet, so the single observed timing is returned directly.
+        Once enough samples exist, the calculation uses the standard-library
+        quantile helper over the raw microsecond timings.
+        """
+        if len(self.times_us) < _MIN_SAMPLES_FOR_P95:
             return self.times_us[0] / 1000
-        return statistics.quantiles(self.times_us, n=20)[18] / 1000
+        return statistics.quantiles(self.times_us, n=_P95_QUANTILES)[_P95_INDEX] / 1000
 
     @property
     def max_ms(self) -> float:
+        """
+        Return the slowest observed latency in milliseconds.
+
+        This remains a direct maximum rather than a smoothed statistic because
+        single outliers are often exactly what an operator wants to notice.
+        """
         return max(self.times_us) / 1000
 
 
@@ -128,6 +156,13 @@ class Stats:
     """
 
     def __init__(self, *, normalize: bool) -> None:
+        """
+        Initialize an empty aggregation state for one live monitoring session.
+
+        The ``normalize`` flag controls whether future ingested lines collapse
+        resource-specific path segments into endpoint placeholders before they
+        are bucketed.
+        """
         self.normalize = normalize
         self.buckets: dict[tuple[str, str], Bucket] = defaultdict(Bucket)
         self.total_lines = 0
@@ -166,6 +201,7 @@ class Stats:
         with self.lock:
             self.buckets[(method, path)].add(time_us, status)
             self.parsed_lines += 1
+
 
 # Column key -> sort key over (key, bucket) tuples.
 _SORT_KEYS: dict[str, callable] = {
@@ -233,7 +269,7 @@ class StatsApp(App):
     }
     """
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding | tuple[str, str, str]]] = [
         ("q", "quit", "Quit"),
         # Override Textual's default Ctrl+C handler (which prints
         # "Keyboard interrupt detected, exiting..."). Priority binding
@@ -250,6 +286,14 @@ class StatsApp(App):
         refresh: float,
         proc: subprocess.Popen,
     ) -> None:
+        """
+        Initialize the UI with shared aggregate state and refresh bookkeeping.
+
+        The app caches rendered rows so refreshes can update only changed cells,
+        which keeps scrolling responsive even while new log lines keep arriving.
+        It also stores the currently selected row key separately from the screen
+        row index so highlighting can survive re-sorts.
+        """
         super().__init__()
         self.stats = stats
         self.app_name = app_name
@@ -265,6 +309,12 @@ class StatsApp(App):
         self._restoring_cursor = False
 
     def compose(self) -> ComposeResult:
+        """
+        Declare the static widget layout for the app shell.
+
+        The hierarchy stays intentionally small so nearly all runtime work can
+        happen inside the table update cycle rather than in a larger widget tree.
+        """
         yield Header()
         yield DataTable(zebra_stripes=True, cursor_type="row")
         yield Footer()
@@ -323,9 +373,7 @@ class StatsApp(App):
         column is more damaging to usability than truncating the path slightly
         earlier.
         """
-        return max(
-            20, self.size.width - self._OTHER_COLS_WIDTH - self._COLUMN_OVERHEAD
-        )
+        return max(20, self.size.width - self._OTHER_COLS_WIDTH - self._COLUMN_OVERHEAD)
 
     @staticmethod
     def _row_key(method: str, path: str) -> str:
@@ -364,9 +412,7 @@ class StatsApp(App):
             return int(str(value) or "0")
         return value
 
-    def on_data_table_header_selected(
-        self, event: DataTable.HeaderSelected
-    ) -> None:
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
         """
         Toggle sort state when the user clicks a column header.
 
@@ -402,9 +448,7 @@ class StatsApp(App):
             return
         self._sort_frozen_until = monotonic() + self._SORT_FREEZE_SEC
 
-    def on_data_table_row_highlighted(
-        self, event: DataTable.RowHighlighted
-    ) -> None:
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         """
         Apply the same row-tracking behavior to highlight changes as to selection.
 
@@ -444,6 +488,139 @@ class StatsApp(App):
         norm = "" if self.stats.normalize else "  (raw paths)"
         self.sub_title = f"sort: {self.sort_col} {arrow}{norm}"
 
+    def _snapshot_items(
+        self,
+    ) -> tuple[list[tuple[tuple[str, str], Bucket]], float, int, int]:
+        """
+        Capture a consistent aggregate snapshot for one refresh tick.
+
+        The reader thread may still be ingesting lines while the UI redraws, so
+        the refresh path copies the current buckets and counters under the shared
+        lock and then performs all rendering work after releasing it.
+        """
+        with self.stats.lock:
+            items = list(self.stats.buckets.items())
+            elapsed = monotonic() - self.stats.started
+            total = self.stats.total_lines
+            parsed = self.stats.parsed_lines
+        items.sort(key=_SORT_KEYS[self.sort_col], reverse=self.sort_reverse)
+        return items, elapsed, total, parsed
+
+    def _render_row(
+        self, method: str, path: str, bucket: Bucket, *, path_width: int
+    ) -> tuple[str, ...]:
+        """
+        Build the rendered cell values for one aggregate row.
+
+        The row cache stores already formatted values because that is exactly what
+        Textual renders and sorts. Centralizing the formatting keeps new-row and
+        changed-row handling consistent.
+        """
+        return (
+            method,
+            _truncate(path, path_width),
+            str(bucket.count),
+            f"{bucket.avg_ms:.0f}",
+            f"{bucket.p95_ms:.0f}",
+            f"{bucket.max_ms:.0f}",
+            str(bucket.errors_4xx) if bucket.errors_4xx else "",
+            str(bucket.errors_5xx) if bucket.errors_5xx else "",
+        )
+
+    def _apply_row_updates(
+        self,
+        table: DataTable,
+        items: list[tuple[tuple[str, str], Bucket]],
+        *,
+        path_width: int,
+    ) -> tuple[set[str], bool]:
+        """
+        Apply row additions and cell-level updates for the current snapshot.
+
+        The return value is the set of row keys that should exist after the tick
+        plus a flag indicating whether the visible table contents changed.
+        """
+        path_width_changed = path_width != self._last_path_width
+        live_row_keys: set[str] = set()
+        rows_changed = False
+        for (method, path), bucket in items:
+            row_key = self._row_key(method, path)
+            live_row_keys.add(row_key)
+            row = self._render_row(method, path, bucket, path_width=path_width)
+            previous_row = self._rendered_rows.get(row_key)
+            if row_key not in table.rows:
+                table.add_row(*row, key=row_key)
+                self._rendered_rows[row_key] = row
+                rows_changed = True
+                continue
+            if previous_row == row and not path_width_changed:
+                continue
+            for column_key, old_value, new_value in zip(
+                _SORT_KEYS, previous_row or (), row, strict=False
+            ):
+                if old_value != new_value:
+                    table.update_cell(
+                        row_key, column_key, new_value, update_width=False
+                    )
+            if previous_row is None:
+                for column_key, new_value in zip(_SORT_KEYS, row, strict=False):
+                    table.update_cell(
+                        row_key, column_key, new_value, update_width=False
+                    )
+            self._rendered_rows[row_key] = row
+            rows_changed = True
+        return live_row_keys, rows_changed
+
+    def _prune_missing_rows(self, table: DataTable, live_row_keys: set[str]) -> bool:
+        """
+        Remove rows that no longer belong in the rendered snapshot.
+
+        When a row disappears under the current grouping or sort state, any
+        cached render state and any selection pointing at that row are cleared
+        alongside the widget row itself.
+        """
+        rows_changed = False
+        for existing_row_key in list(table.rows):
+            existing_key = str(existing_row_key.value)
+            if existing_key not in live_row_keys:
+                table.remove_row(existing_row_key)
+                self._rendered_rows.pop(existing_key, None)
+                if existing_key == self._selected_row_key:
+                    self._selected_row_key = None
+                rows_changed = True
+        return rows_changed
+
+    def _maybe_sort_rows(self, table: DataTable, *, rows_changed: bool) -> None:
+        """
+        Re-sort the table when data changed and interaction is not frozen.
+
+        Sorting pauses briefly while the user is actively interacting with a row
+        highlight so the viewport does not feel like it is fighting the user.
+        """
+        sort_is_frozen = monotonic() < self._sort_frozen_until
+        if (rows_changed or self._needs_sort) and not sort_is_frozen:
+            table.sort(key=self._sort_key_from_row, reverse=self.sort_reverse)
+            self._needs_sort = False
+
+    def _restore_selected_row(self, table: DataTable) -> None:
+        """
+        Move the cursor back onto the same logical row after updates.
+
+        Selection follows the row key rather than the previous screen position.
+        Cursor moves triggered by this restoration are marked so they do not
+        create a new sort-freeze window.
+        """
+        if self._selected_row_key and self._selected_row_key in table.rows:
+            selected_row_index = table.get_row_index(self._selected_row_key)
+            if table.cursor_row != selected_row_index:
+                self._restoring_cursor = True
+                try:
+                    table.move_cursor(
+                        row=selected_row_index, animate=False, scroll=False
+                    )
+                finally:
+                    self._restoring_cursor = False
+
     def _tick(self) -> None:
         """
         Synchronize the rendered table with the current aggregate snapshot.
@@ -464,71 +641,15 @@ class StatsApp(App):
         table = self.query_one(DataTable)
         if len(table.columns) != len(_SORT_KEYS):
             return
-        with self.stats.lock:
-            items = list(self.stats.buckets.items())
-            elapsed = monotonic() - self.stats.started
-            total = self.stats.total_lines
-            parsed = self.stats.parsed_lines
-        items.sort(key=_SORT_KEYS[self.sort_col], reverse=self.sort_reverse)
-
-        pw = self._path_width()
-        path_width_changed = pw != self._last_path_width
-        live_row_keys: set[str] = set()
-        rows_changed = False
-        for (method, path), bucket in items:
-            row_key = self._row_key(method, path)
-            live_row_keys.add(row_key)
-            row = (
-                method,
-                _truncate(path, pw),
-                str(bucket.count),
-                f"{bucket.avg_ms:.0f}",
-                f"{bucket.p95_ms:.0f}",
-                f"{bucket.max_ms:.0f}",
-                str(bucket.errors_4xx) if bucket.errors_4xx else "",
-                str(bucket.errors_5xx) if bucket.errors_5xx else "",
-            )
-            previous_row = self._rendered_rows.get(row_key)
-            if row_key not in table.rows:
-                table.add_row(*row, key=row_key)
-                self._rendered_rows[row_key] = row
-                rows_changed = True
-                continue
-            if previous_row == row and not path_width_changed:
-                continue
-            for column_key, old_value, new_value in zip(_SORT_KEYS, previous_row or (), row, strict=False):
-                if old_value != new_value:
-                    table.update_cell(row_key, column_key, new_value, update_width=False)
-            if previous_row is None:
-                for column_key, new_value in zip(_SORT_KEYS, row, strict=False):
-                    table.update_cell(row_key, column_key, new_value, update_width=False)
-            self._rendered_rows[row_key] = row
-            rows_changed = True
-
-        for existing_row_key in list(table.rows):
-            existing_key = str(existing_row_key.value)
-            if existing_key not in live_row_keys:
-                table.remove_row(existing_row_key)
-                self._rendered_rows.pop(existing_key, None)
-                if existing_key == self._selected_row_key:
-                    self._selected_row_key = None
-                rows_changed = True
-
-        sort_is_frozen = monotonic() < self._sort_frozen_until
-        if (rows_changed or self._needs_sort) and not sort_is_frozen:
-            table.sort(key=self._sort_key_from_row, reverse=self.sort_reverse)
-            self._needs_sort = False
-        if self._selected_row_key and self._selected_row_key in table.rows:
-            selected_row_index = table.get_row_index(self._selected_row_key)
-            if table.cursor_row != selected_row_index:
-                self._restoring_cursor = True
-                try:
-                    table.move_cursor(
-                        row=selected_row_index, animate=False, scroll=False
-                    )
-                finally:
-                    self._restoring_cursor = False
-        self._last_path_width = pw
+        items, elapsed, total, parsed = self._snapshot_items()
+        path_width = self._path_width()
+        live_row_keys, rows_changed = self._apply_row_updates(
+            table, items, path_width=path_width
+        )
+        rows_changed = self._prune_missing_rows(table, live_row_keys) or rows_changed
+        self._maybe_sort_rows(table, rows_changed=rows_changed)
+        self._restore_selected_row(table)
+        self._last_path_width = path_width
         self.title = (
             f"apppack-stats for {self.app_name} — "
             f"{parsed}/{total} lines, {elapsed:.0f}s"
@@ -615,16 +736,19 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     cmd = [
-        "apppack", "logs",
-        "-a", args.app,
+        "apppack",
+        "logs",
+        "-a",
+        args.app,
         "--follow",
         "--raw",
-        "--start", args.start,
+        "--start",
+        args.start,
     ]
     if args.prefix:
         cmd += ["--prefix", args.prefix]
 
-    proc = subprocess.Popen(
+    proc = subprocess.Popen(  # noqa: S603
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -637,7 +761,9 @@ def main(argv: list[str] | None = None) -> int:
         # pipe and bleeding into the user's terminal after we quit.
         start_new_session=True,
     )
-    assert proc.stdout is not None
+    if proc.stdout is None:
+        sys.stderr.write("error: failed to capture apppack stdout.\n")
+        return 2
 
     stats = Stats(normalize=args.normalize)
     stop = threading.Event()
@@ -682,9 +808,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _write_csv(
-    stats: Stats, path: str, *, sort_col: str, reverse: bool
-) -> None:
+def _write_csv(stats: Stats, path: str, *, sort_col: str, reverse: bool) -> None:
     """
     Write the current aggregate snapshot in the same order as the live table.
 
@@ -728,7 +852,7 @@ def _write_csv(
     if path == "-":
         emit(sys.stdout)
     else:
-        with open(path, "w", newline="") as f:
+        with Path(path).open("w", newline="") as f:
             emit(f)
 
 
