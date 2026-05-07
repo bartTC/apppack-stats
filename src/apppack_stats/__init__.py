@@ -36,7 +36,7 @@ from textual.widgets import DataTable, Footer, Header
 
 from apppack_stats.extractors import extract_request, looks_like_apache_clf
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # Order matters: UUIDs and hex hashes before bare ints.
 _UUID_RE = re.compile(
