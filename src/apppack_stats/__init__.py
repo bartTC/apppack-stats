@@ -36,7 +36,7 @@ from textual.widgets import DataTable, Footer, Header
 
 from apppack_stats.extractors import extract_request
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # Order matters: UUIDs and hex hashes before bare ints.
 _UUID_RE = re.compile(
