@@ -232,6 +232,38 @@ def _truncate(s: str, width: int) -> str:
     return s[: width - 1] + "…"
 
 
+def _copy_to_system_clipboard(text: str) -> bool:
+    """
+    Pipe ``text`` into the first available platform clipboard binary.
+
+    OSC 52 escapes are unreliable across terminal/tmux setups, so the app
+    prefers a native clipboard tool when one is on ``PATH``. The candidates are
+    ordered so the most common per-platform choice runs first: ``pbcopy`` on
+    macOS, then Wayland, then X11. Returns ``True`` only when the binary
+    exists and exits cleanly.
+    """
+    if sys.platform == "darwin":
+        candidates = [["pbcopy"]]
+    else:
+        candidates = [
+            ["wl-copy"],
+            ["xclip", "-selection", "clipboard"],
+            ["xsel", "-b", "-i"],
+        ]
+    for cmd in candidates:
+        if shutil.which(cmd[0]) is None:
+            continue
+        try:
+            proc = subprocess.run(  # noqa: S603
+                cmd, input=text, text=True, check=False, capture_output=True
+            )
+        except OSError:
+            continue
+        if proc.returncode == 0:
+            return True
+    return False
+
+
 def _reader_thread(stats: Stats, stream: IO[str], stop: threading.Event) -> None:
     """
     Drain the subprocess log stream until told to stop or EOF is reached.
@@ -276,6 +308,7 @@ class StatsApp(App):
         # intercepts the keypress before the SIGINT path runs.
         Binding("ctrl+c", "quit", show=False, priority=True),
         ("n", "toggle_normalize", "Toggle path normalization"),
+        ("c", "copy_path", "Copy path"),
     ]
 
     def __init__(
@@ -461,6 +494,27 @@ class StatsApp(App):
         if self._restoring_cursor:
             return
         self._sort_frozen_until = monotonic() + self._SORT_FREEZE_SEC
+
+    def action_copy_path(self) -> None:
+        """
+        Copy the highlighted row's path to the system clipboard.
+
+        Prefers a real system clipboard binary (``pbcopy`` on macOS,
+        ``wl-copy``/``xclip``/``xsel`` on Linux) because OSC 52 is unreliable —
+        many terminals and tmux configurations swallow the escape. Textual's
+        ``copy_to_clipboard`` is used as a last-resort fallback so the action
+        still does something useful over SSH or in stripped-down environments.
+        The full normalized or raw path is copied (not the on-screen truncated
+        form) so users get an actionable value.
+        """
+        if not self._selected_row_key:
+            return
+        _, _, path = self._selected_row_key.partition("\0")
+        if not path:
+            return
+        if not _copy_to_system_clipboard(path):
+            self.copy_to_clipboard(path)
+        self.notify(f"Copied: {path}", timeout=2)
 
     def action_toggle_normalize(self) -> None:
         """
