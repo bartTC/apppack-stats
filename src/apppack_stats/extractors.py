@@ -14,10 +14,34 @@ avoid accidental collisions.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 # Multiplier from each supported unit to microseconds.
 _TO_US = {"us": 1, "ms": 1_000, "s": 1_000_000}
+
+# Apache/NCSA Common and Combined Log Format detector. We only use this to
+# *recognize* such lines so the app can surface a helpful error — these formats
+# do not contain a request-time field, so they cannot drive the latency table.
+# Pattern: ``IP ident user [date] "METHOD ..."`` where the method is a real
+# HTTP verb. Anchoring on the verb keeps false positives away from random
+# bracketed log lines.
+_APACHE_CLF_RE = re.compile(
+    r"^\S+ \S+ \S+ \[[^\]]+\] "
+    r'"(?:GET|POST|PUT|DELETE|HEAD|PATCH|OPTIONS|TRACE|CONNECT)\b'
+)
+
+
+def looks_like_apache_clf(line: str) -> bool:
+    """
+    Return ``True`` if ``line`` resembles Apache Common/Combined Log Format.
+
+    The check is deliberately a tight regex rather than a full parser. We only
+    need to recognize that the user is feeding us a timing-less plain-text
+    access log so the CLI can exit early with a configuration hint, and a tight
+    pattern keeps false matches against unrelated bracketed text away.
+    """
+    return bool(_APACHE_CLF_RE.match(line))
 
 
 @dataclass(frozen=True)

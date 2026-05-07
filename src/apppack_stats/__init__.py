@@ -34,7 +34,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import DataTable, Footer, Header
 
-from apppack_stats.extractors import extract_request
+from apppack_stats.extractors import extract_request, looks_like_apache_clf
 
 __version__ = "0.5.0"
 
@@ -167,6 +167,7 @@ class Stats:
         self.buckets: dict[tuple[str, str], Bucket] = defaultdict(Bucket)
         self.total_lines = 0
         self.parsed_lines = 0
+        self.unsupported_clf_lines = 0
         self.started = monotonic()
         self.lock = threading.Lock()
 
@@ -184,7 +185,14 @@ class Stats:
         """
         self.total_lines += 1
         line = line.strip()
-        if not line or line[0] != "{":
+        if not line:
+            return
+        if line[0] != "{":
+            # Plain-text Apache/NCSA access logs land here. We can't extract
+            # latency from them, but we count detections so the app can exit
+            # with a clear configuration hint instead of staying empty forever.
+            if looks_like_apache_clf(line):
+                self.unsupported_clf_lines += 1
             return
         try:
             payload = json.loads(line)
@@ -201,6 +209,34 @@ class Stats:
         with self.lock:
             self.buckets[(method, path)].add(time_us, status)
             self.parsed_lines += 1
+
+
+# Bail out once we've clearly seen Apache/NCSA text logs and no parseable
+# JSON. The thresholds let one or two stray lines slip past without exiting,
+# but a sustained stream of timing-less lines triggers the configuration hint.
+_CLF_BAIL_MIN_TOTAL = 20
+_CLF_BAIL_MIN_DETECTED = 10
+
+_CLF_ERROR_MESSAGE = """\
+error: input looks like Apache/NCSA Common or Combined Log Format access logs.
+
+These lines contain status codes and paths but no request-time field, so
+apppack-stats cannot compute latency statistics from them.
+
+apppack-stats reads JSON access logs containing a request-time field. Two
+supported shapes:
+
+  AppPack default (microseconds):
+    {"method": "GET", "path": "/foo", "status": 200, "response_time_us": 1234}
+
+  gunicorn structlog (seconds, float):
+    {"request_method": "GET", "request_path": "/foo",
+     "response_status": 200, "response_time": 0.012}
+
+Configure your app server to emit JSON access logs in one of these shapes
+(see your framework's structured-logging docs, or gunicorn's --access-logformat
+with a JSON formatter) and rerun apppack-stats.
+"""
 
 
 # Column key -> sort key over (key, bucket) tuples.
@@ -340,6 +376,7 @@ class StatsApp(App):
         self._sort_frozen_until = 0.0
         self._selected_row_key: str | None = None
         self._restoring_cursor = False
+        self.exit_error: str | None = None
 
     def compose(self) -> ComposeResult:
         """
@@ -675,6 +712,21 @@ class StatsApp(App):
                 finally:
                     self._restoring_cursor = False
 
+    def _should_bail_clf(self) -> bool:
+        """
+        Decide whether we have enough evidence to abort with a CLF hint.
+
+        We require both a meaningful total of input lines and a clear majority
+        of Apache-CLF-shaped lines among them, so a tiny burst of unrelated
+        text or a single malformed line does not push the user out of the UI.
+        """
+        with self.stats.lock:
+            return (
+                self.stats.parsed_lines == 0
+                and self.stats.total_lines >= _CLF_BAIL_MIN_TOTAL
+                and self.stats.unsupported_clf_lines >= _CLF_BAIL_MIN_DETECTED
+            )
+
     def _tick(self) -> None:
         """
         Synchronize the rendered table with the current aggregate snapshot.
@@ -690,6 +742,10 @@ class StatsApp(App):
         interaction. If the subprocess has already exited, the app simply quits.
         """
         if self.proc.poll() is not None:
+            self.exit()
+            return
+        if self._should_bail_clf():
+            self.exit_error = _CLF_ERROR_MESSAGE
             self.exit()
             return
         table = self.query_one(DataTable)
@@ -708,6 +764,27 @@ class StatsApp(App):
             f"apppack-stats for {self.app_name} — "
             f"{parsed}/{total} lines, {elapsed:.0f}s"
         )
+
+
+def _shutdown_apppack_proc(proc: subprocess.Popen) -> bool:
+    """
+    Tear down the spawned ``apppack`` subprocess and report who initiated it.
+
+    A live subprocess at this point means the user quit the UI while ``apppack``
+    was still running, so we send it ``SIGTERM``. If it had already exited on
+    its own, we leave the return code intact for the caller to interpret.
+    Returns ``True`` when the shutdown was driven by us, ``False`` when the
+    subprocess died on its own.
+    """
+    user_initiated = proc.poll() is None
+    if user_initiated:
+        proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    return user_initiated
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -827,22 +904,11 @@ def main(argv: list[str] | None = None) -> int:
     reader.start()
 
     app = StatsApp(stats, app_name=args.app, refresh=args.refresh, proc=proc)
-    user_initiated = False
     try:
         app.run()
     finally:
         stop.set()
-        # If apppack is still running, we're tearing it down ourselves
-        # (the user pressed q / Ctrl+C). Otherwise it died on its own
-        # and any captured stderr is a real error worth surfacing.
-        user_initiated = proc.poll() is None
-        if user_initiated:
-            proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        user_initiated = _shutdown_apppack_proc(proc)
 
     if args.output:
         _write_csv(
@@ -853,6 +919,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.output != "-":
             pass
+
+    if app.exit_error:
+        sys.stderr.write(app.exit_error)
+        return 2
 
     if not user_initiated and proc.returncode != 0:
         stderr = proc.stderr.read() if proc.stderr else ""

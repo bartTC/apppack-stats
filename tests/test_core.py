@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from apppack_stats import Stats, _write_csv, normalize_path
-from apppack_stats.extractors import extract_request
+from apppack_stats.extractors import extract_request, looks_like_apache_clf
 
 
 def test_normalize_path_rewrites_ids_hashes_and_uuids() -> None:
@@ -50,6 +50,38 @@ def test_stats_ingest_aggregates_and_normalizes() -> None:
     assert bucket.errors_4xx == 1
     assert bucket.errors_5xx == 0
     assert bucket.avg_ms == 1.5
+
+
+def test_looks_like_apache_clf_recognizes_common_and_combined_lines() -> None:
+    combined = (
+        "10.21.73.241 - - [07/May/2026:09:02:13 +0000] "
+        '"GET /cat-health HTTP/1.1" 200 8015 "-" "Amazon CloudFront"'
+    )
+    common = (
+        "10.21.73.241 - - [07/May/2026:09:02:13 +0000] "
+        '"GET /cat-health HTTP/1.1" 200 7218'
+    )
+    assert looks_like_apache_clf(combined)
+    assert looks_like_apache_clf(common)
+    assert not looks_like_apache_clf('{"method":"GET","path":"/x","status":200}')
+    assert not looks_like_apache_clf("[2026-05-07] some random log line")
+
+
+def test_stats_ingest_counts_apache_clf_lines() -> None:
+    stats = Stats(normalize=False)
+    stats.ingest(
+        '10.21.73.241 - - [07/May/2026:09:02:13 +0000] "GET /a HTTP/1.1" 200 100'
+    )
+    stats.ingest(
+        "10.21.74.90 - - [07/May/2026:09:02:14 +0000] "
+        '"POST /b HTTP/1.1" 500 0 "-" "ELB-HealthChecker/2.0"'
+    )
+    stats.ingest("not an access log")
+    stats.ingest('{"method":"GET","path":"/c","status":200,"response_time_us":10}')
+
+    assert stats.total_lines == 4
+    assert stats.parsed_lines == 1
+    assert stats.unsupported_clf_lines == 2
 
 
 def test_write_csv_sorts_and_emits_expected_columns(capsys) -> None:

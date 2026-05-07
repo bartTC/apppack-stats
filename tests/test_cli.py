@@ -50,6 +50,7 @@ class FakeStatsApp:
         self.proc = proc
         self.sort_col = "avg"
         self.sort_reverse = True
+        self.exit_error = None
         FakeStatsApp.last_instance = self
 
     def run(self) -> None:
