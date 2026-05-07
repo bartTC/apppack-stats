@@ -240,6 +240,9 @@ class StatsApp(App):
         items.sort(key=_SORT_KEYS[self.sort_col], reverse=self.sort_reverse)
 
         table = self.query_one(DataTable)
+        # Preserve the user's scroll position across the clear/re-add
+        # cycle — otherwise every tick yanks them back to the top.
+        saved_scroll_y = table.scroll_y
         table.clear()
         pw = self._path_width()
         for (method, path), bucket in items:
@@ -253,6 +256,8 @@ class StatsApp(App):
                 str(bucket.errors_4xx) if bucket.errors_4xx else "",
                 str(bucket.errors_5xx) if bucket.errors_5xx else "",
             )
+        if saved_scroll_y:
+            table.scroll_to(y=saved_scroll_y, animate=False)
         self.title = f"apppack-stats — {parsed}/{total} lines, {elapsed:.0f}s"
 
 

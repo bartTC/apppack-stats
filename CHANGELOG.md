@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a new session (no controlling TTY) and, when *we* are the ones
   shutting it down, swallow its captured stderr — any signal-handler
   noise it emits is a side effect of our signal, not a real error.
+- The DataTable no longer yanks the viewport back to the top on every
+  refresh tick. The scroll offset is saved before the rebuild and
+  restored after, so scrolling stays where you put it.
 
 ### Removed
 
