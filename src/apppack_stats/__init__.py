@@ -22,6 +22,7 @@ from time import monotonic
 from typing import IO
 
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.widgets import DataTable, Footer, Header
 
 from apppack_stats.extractors import extract_request
@@ -46,14 +47,17 @@ def normalize_path(path: str) -> str:
 @dataclass
 class Bucket:
     count: int = 0
-    errors: int = 0
+    errors_4xx: int = 0
+    errors_5xx: int = 0
     times_us: list[int] = field(default_factory=list)
 
     def add(self, time_us: int, status: int) -> None:
         self.count += 1
         self.times_us.append(time_us)
-        if status >= 400:
-            self.errors += 1
+        if 400 <= status < 500:
+            self.errors_4xx += 1
+        elif status >= 500:
+            self.errors_5xx += 1
 
     @property
     def avg_ms(self) -> float:
@@ -108,10 +112,17 @@ _SORT_KEYS: dict[str, "callable"] = {
     "avg": lambda kv: kv[1].avg_ms,
     "p95": lambda kv: kv[1].p95_ms,
     "max": lambda kv: kv[1].max_ms,
-    "err": lambda kv: kv[1].errors,
+    "4xx": lambda kv: kv[1].errors_4xx,
+    "5xx": lambda kv: kv[1].errors_5xx,
 }
 
-_NUMERIC_COLS = {"count", "avg", "p95", "max", "err"}
+_NUMERIC_COLS = {"count", "avg", "p95", "max", "4xx", "5xx"}
+
+
+def _truncate(s: str, width: int) -> str:
+    if width <= 1 or len(s) <= width:
+        return s
+    return s[: width - 1] + "…"
 
 
 def _reader_thread(stats: Stats, stream: IO[str], stop: threading.Event) -> None:
@@ -133,6 +144,10 @@ class StatsApp(App):
 
     BINDINGS = [
         ("q", "quit", "Quit"),
+        # Override Textual's default Ctrl+C handler (which prints
+        # "Keyboard interrupt detected, exiting..."). Priority binding
+        # intercepts the keypress before the SIGINT path runs.
+        Binding("ctrl+c", "quit", show=False, priority=True),
         ("n", "toggle_normalize", "Toggle path normalization"),
     ]
 
@@ -155,6 +170,15 @@ class StatsApp(App):
         yield DataTable(zebra_stripes=True, cursor_type="row")
         yield Footer()
 
+    # Fixed widths of every non-path column (see ``on_mount``). Used to
+    # compute how much room is left for the Path column on the current
+    # terminal so the numeric columns never get pushed offscreen.
+    _OTHER_COLS_WIDTH = 8 + 8 + 8 + 8 + 8 + 6 + 6
+    # Per-cell padding/borders that DataTable reserves around each
+    # column. Conservative — we'd rather leave a little gap on the
+    # right than clip a column.
+    _COLUMN_OVERHEAD = 12
+
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         table.add_column("Method", key="method", width=8)
@@ -163,11 +187,22 @@ class StatsApp(App):
         table.add_column("Avg ms", key="avg", width=8)
         table.add_column("p95 ms", key="p95", width=8)
         table.add_column("Max ms", key="max", width=8)
-        table.add_column("Err", key="err", width=6)
+        table.add_column("4xx", key="4xx", width=6)
+        table.add_column("5xx", key="5xx", width=6)
         self.title = "apppack-stats"
         self._update_subtitle()
         self.set_interval(self.refresh_sec, self._tick)
         self._tick()
+
+    def on_resize(self) -> None:
+        # Re-render immediately so the path column is recomputed for
+        # the new terminal width.
+        self._tick()
+
+    def _path_width(self) -> int:
+        return max(
+            20, self.size.width - self._OTHER_COLS_WIDTH - self._COLUMN_OVERHEAD
+        )
 
     def on_data_table_header_selected(
         self, event: DataTable.HeaderSelected
@@ -206,15 +241,17 @@ class StatsApp(App):
 
         table = self.query_one(DataTable)
         table.clear()
+        pw = self._path_width()
         for (method, path), bucket in items:
             table.add_row(
                 method,
-                path,
+                _truncate(path, pw),
                 str(bucket.count),
                 f"{bucket.avg_ms:.0f}",
                 f"{bucket.p95_ms:.0f}",
                 f"{bucket.max_ms:.0f}",
-                str(bucket.errors) if bucket.errors else "",
+                str(bucket.errors_4xx) if bucket.errors_4xx else "",
+                str(bucket.errors_5xx) if bucket.errors_5xx else "",
             )
         self.title = f"apppack-stats — {parsed}/{total} lines, {elapsed:.0f}s"
 
@@ -291,8 +328,14 @@ def main(argv: list[str] | None = None) -> int:
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
         text=True,
         bufsize=1,
+        # Detach apppack from our session so it has no controlling
+        # terminal. Otherwise it writes "Keyboard interrupt detected,
+        # exiting..." to /dev/tty on shutdown, bypassing our stderr
+        # pipe and bleeding into the user's terminal after we quit.
+        start_new_session=True,
     )
     assert proc.stdout is not None
 
@@ -304,11 +347,17 @@ def main(argv: list[str] | None = None) -> int:
     reader.start()
 
     app = StatsApp(stats, refresh=args.refresh, proc=proc)
+    user_initiated = False
     try:
         app.run()
     finally:
         stop.set()
-        proc.terminate()
+        # If apppack is still running, we're tearing it down ourselves
+        # (the user pressed q / Ctrl+C). Otherwise it died on its own
+        # and any captured stderr is a real error worth surfacing.
+        user_initiated = proc.poll() is None
+        if user_initiated:
+            proc.terminate()
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
@@ -322,13 +371,14 @@ def main(argv: list[str] | None = None) -> int:
             sort_col=app.sort_col,
             reverse=app.sort_reverse,
         )
+        if args.output != "-":
+            print(f"Wrote {len(stats.buckets)} rows to {args.output}")
 
-    rc = proc.returncode or 0
-    if rc not in (0, -15):
+    if not user_initiated and proc.returncode != 0:
         stderr = proc.stderr.read() if proc.stderr else ""
         if stderr:
             sys.stderr.write(stderr)
-        return rc
+        return proc.returncode
     return 0
 
 
@@ -342,7 +392,16 @@ def _write_csv(
     def emit(out: IO[str]) -> None:
         writer = csv.writer(out)
         writer.writerow(
-            ["method", "path", "count", "avg_ms", "p95_ms", "max_ms", "errors"]
+            [
+                "method",
+                "path",
+                "count",
+                "avg_ms",
+                "p95_ms",
+                "max_ms",
+                "errors_4xx",
+                "errors_5xx",
+            ]
         )
         for (method, p), bucket in items:
             writer.writerow(
@@ -353,7 +412,8 @@ def _write_csv(
                     f"{bucket.avg_ms:.1f}",
                     f"{bucket.p95_ms:.1f}",
                     f"{bucket.max_ms:.1f}",
-                    bucket.errors,
+                    bucket.errors_4xx,
+                    bucket.errors_5xx,
                 ]
             )
 

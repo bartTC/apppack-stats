@@ -18,6 +18,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stats are written to PATH as CSV after the app exits, sorted by
   whichever column was active in the UI. Pass `-` to write to stdout.
 
+### Changed
+
+- The single "Err" column has been split into separate "4xx" and "5xx"
+  columns (and `errors_4xx` / `errors_5xx` in the CSV output). 4xx
+  responses are usually noise (404 on `/favicon.ico`, 401s, etc.);
+  5xx responses are the signal you actually want to surface.
+- Long request paths are now truncated with an ellipsis so the
+  numeric columns are always visible, even on narrow terminals. The
+  truncation width adapts to the terminal width on resize.
+
+### Fixed
+
+- `apppack` no longer leaks its "Keyboard interrupt detected,
+  exiting..." message to the user's terminal on quit. We spawn it in
+  a new session (no controlling TTY) and, when *we* are the ones
+  shutting it down, swallow its captured stderr — any signal-handler
+  noise it emits is a side effect of our signal, not a real error.
+
 ### Removed
 
 - The static rich summary table that was printed after the Textual app
